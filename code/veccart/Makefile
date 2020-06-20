@@ -47,9 +47,10 @@ docker-build: Dockerfile
 	docker build . -t stm32-build
 
 docker:
-	docker run --rm -t -v `pwd`:/build/veccart -u `id -u ${USER}`:`id -g ${USER}` stm32-build make images
+	docker run --rm -t -v `pwd`/build/veccart stm32-build make images
 
 images: $(BINARY).images
+
 flash: $(BINARY).flash
 
 rom.o: rom.inc rom.c rom.h
