@@ -66,6 +66,17 @@ UF2_ARGS="USE_UF2=0"
 LDSCRIPT=stm32f411rct6.ld
 endif
 
+# U4 /OE driven by the STM32 (PB8) instead of U3: requires U3 removed and R7 fitted (0R).
+# Enables 2 x 48K bankswitched games ($0000-$BFFF, PB6 selects the bank).
+# USAGE: make clean all USE_HW=v1.0 USE_OE_CTRL=1
+ifeq ($(USE_OE_CTRL),1)
+OE_CTRL_ARGS="USE_OE_CTRL=1"
+CFLAGS += -DOE_CTRL=1
+ASFLAGS += -DOE_CTRL=1
+else
+OE_CTRL_ARGS="USE_OE_CTRL=0"
+endif
+
 BINARY=VEXTREME
 OBJS=main.o menu.o romemu.o msc.o xprintf.o usb_msc.o ff_diskio.o \
 		fatfs/ff.o fatfs/option/unicode.o flash.o led.o delay.o \
@@ -114,7 +125,7 @@ docker-build: Dockerfile
 	docker build . -t stm32-build
 
 docker:
-	${STM_DOCKER} make images $(HW_VER_ARGS) $(UF2_ARGS)
+	${STM_DOCKER} make images $(HW_VER_ARGS) $(UF2_ARGS) $(OE_CTRL_ARGS)
 
 uf2: $(BINARY).bin
 	${STM_DOCKER} uf2conv.py -b 0x08004000 -o $(BINARY).uf2 -c $(BINARY).bin

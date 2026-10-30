@@ -36,6 +36,21 @@ initloop:
     ldr   r7,=0xfffe            // reset vector constant
     ldr   r9,=0x40011004        // USART1_DR for quick addr pointer to Serial Debugging TX
                                 // USART1_SR = 0x40011000
+#if OE_CTRL
+// ===========================================================
+// U3 removed, R7 fitted: PB8 drives U4 /OE (the Vectrex data bus buffer)
+    ldr   r11,=0x01000000       // GPIOB_BSRR value: reset PB8, U4 /OE low (U4 on)
+    ldr   r12,=0x00000100       // GPIOB_BSRR value: set PB8, U4 /OE high (U4 off)
+    ldr   r0,=0x08020000        // GAME48_FLASH_BASE: is a 48K bankswitched game running?
+    mov   r10,#0                // r10 = 1 if romData is the 48K game image in flash, else 0
+    cmp   r2,r0                 // |
+    it    eq                    // |
+    moveq r10,#1                // |
+#if (HW_VER < 3)
+    #error "USE_OE_CTRL=1 requires v0.3 or later hardware"
+#endif
+#endif // OE_CTRL
+// ===========================================================
 
 wloop:
     // Check for 6809 reset vector (0xFFFE)
@@ -48,6 +63,9 @@ wloop:
     ldr   r0,[r1, 0x10]         // Load addr pins
     cmp   r0,r7                 // Compare to 6809 reset vector
     bne   clearcount            // Matched? clearcount if not
+#if OE_CTRL
+    str   r12,[r4, 0x18]        // U4 off: the BIOS ROM answers the reset vector, and we may leave the loop
+#endif
 
 #if (HW_VER < 3)
 // ===========================================================
@@ -108,6 +126,9 @@ put_menu_back:
     ldr   r0,=romData           // Reset vector detected for more than 300ms, set romData to menuData
     ldr   r2,=menuData          // |
     str   r2,[r0]               // |
+#if OE_CTRL
+    mov   r10,#0                // Menu is not a 48K game (no $8000-$BFFF reads from menuData)
+#endif
     mov   r0,# 'g'              // Restore copyright bytes just in case we got reset in Dev Mode
     strb  r0,[r2, #0]           // |
     mov   r0,# ' '              // |
@@ -151,6 +172,16 @@ clearcount:
     and   r8,#0
 resetexit:
 
+#if OE_CTRL
+    // Is /CE (A15) active? One read of GPIOB gives A15 (bit 15) and R/W (bit 1)
+    ldr   r0,[r4, 0x10]
+    lsls  r6,r0,#(31-15)        // Shift bit 15 into sign flag
+    bmi   a15high               // Bit 15 set? $8000-$FFFF, see a15high
+
+    // Check for a write
+    lsls  r6,r0,#(31-1)         // Shift bit 1 into sign flag
+    bpl   write                 // Bit 1 clear? Is write!
+#else
     // Wait for /CE (A15) to become active
     ldr   r0,[r4, 0x10]
     lsls  r0,#(31-15)           // Shift bit 15 into sign flag
@@ -160,6 +191,7 @@ resetexit:
     ldr   r0,[r4, 0x10]
     lsls  r0,#(31-1)            // Shift bit 1 into sign flag
     bpl   write                 // Bit 1 clear? Is write!
+#endif
 
     // Handle read: load address, get byte, send to Vectrex
     ldr   r0,[r1, 0x10]         // Load addr pins
@@ -172,11 +204,39 @@ resetexit:
     // IF WE CLOBBER R2, RELOAD IT
     //ldr   r6,=romData           // Load ROM data array addr in scratch r0
     //ldr   r2,[r6]               // romData pointer deferenced in r2
+readbyte:
     ldrb  r5,[r0, r2]           // Load corresponding byte in rom
     orr.w r5,r5,#0xff0000       // Set shit (this clears 0-7, but then the set register overrides the cleared bits)
     str   r5,[r3, 0x18]         // Output
+#if OE_CTRL
+    str   r11,[r4, 0x18]        // U4 on: drive the byte onto the Vectrex data bus
+#endif
 
     b     wloop
+
+#if OE_CTRL
+// ===========================================================
+// A15 high: $8000-$BFFF is ours only while a 48K game runs; $C000-$FFFF is Vectrex RAM, VIA and BIOS.
+// 48K game image layout (romData = GAME48_FLASH_BASE), index = (addr pins ^ 0x8000) as for $0000-$7FFF:
+//   0x00000-0x0FFFF  $0000-$7FFF of both banks (PB6 high bank first, as for 64K games)
+//   0x10000-0x1FFFF  $8000-$BFFF of both banks (A14 = 0, so 16K at 0x10000 and 16K at 0x18000)
+a15high:
+    cmp   r10,#0                // 48K game running?
+    beq   u4off                 // No, $8000-$FFFF is not ours
+    ldr   r5,[r1, 0x10]         // Load addr pins (A0-A14, PB6)
+    lsls  r6,r5,#(31-14)        // Shift A14 into sign flag
+    bmi   u4off                 // A14 set? $C000-$FFFF, not ours
+    lsls  r6,r0,#(31-1)         // Shift R/W (bit 1 of GPIOB) into sign flag
+    bpl   u4off                 // Write? Nothing to write to at $8000-$BFFF
+    eor   r0,r5,#0x8000         // Invert PB6 as for $0000-$7FFF
+    add   r0,r0,#0x10000        // $8000-$BFFF windows start 64K into the image
+    b     readbyte
+
+u4off:
+    str   r12,[r4, 0x18]        // U4 off: release the Vectrex data bus
+    b     wloop
+#endif // OE_CTRL
+// ===========================================================
 
 write:
     // The Vec writes to the cart. Seemingly, we need to do something
@@ -185,6 +245,9 @@ write:
     lsr   r6,#16                // Nuke bottom 16 bits...
     lsl   r6,#16                // ...by shifting them out and zeroes back.
     str   r6,[r3, 0]            // Set bottom 8 pins of gpioa to input
+#if OE_CTRL
+    str   r11,[r4, 0x18]        // U4 on: pass the written byte through to port A (U4 DIR follows R/W)
+#endif
     ldr   r0,[r1, 0x10]         // Load addr word from gpioc
     ubfx  r0,r0,#0,#15          // and with 0x7fff
 
@@ -210,6 +273,9 @@ waitdataloop:
 
     ldr   r5,[r3, 0x10]         // Load data
     and   r5,#0xff
+#if OE_CTRL
+    str   r12,[r4, 0x18]        // U4 off before port A drives again
+#endif
     str   r7,[r3, 0]            // Restore bottom half of gpioa to output
 
     // From here on:

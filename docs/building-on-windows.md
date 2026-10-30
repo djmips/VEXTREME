@@ -26,7 +26,8 @@ Or from WSL: `code/build-wsl.sh` with the same options.
 | `-r` | `HEAD` | commit, branch or tag to build. Uncommitted changes are not built. |
 | `-H` | `v1.0` | hardware: `v0.2`, `v0.3`, `v0.4`, `v1.0` |
 | `-U` | `1` | `1`: UF2 layout (app at `0x08004000`, needs the UF2 bootloader). `0`: plain image at `0x08000000`. |
-| `-o` | `build/<sw>-hw<hw>[-uf2]-<sha>/` | output folder |
+| `-E` | `0` | `1`: the STM32 drives U4 `/OE`, for boards with U3 removed and R7 fitted; adds 2 x 48K bankswitched games. See [48K Bankswitched Games](48k-bankswitching.md). |
+| `-o` | `build/<sw>-hw<hw>[-uf2][-oe]-<sha>/` | output folder |
 
 The output folder gets `VEXTREME.uf2` (UF2 builds), the `.bin`, `.elf`, `.map` and the `menu.bin` built
 into it. For flashing, see [Firmware Updates](firmware-updates.md) and the README.

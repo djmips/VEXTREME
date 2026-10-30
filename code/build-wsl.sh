@@ -3,12 +3,13 @@
 # Build the VEXTREME menu and STM32 firmware under WSL (or any Linux), without Docker.
 #
 # Usage (from the repo, in WSL):
-#   code/build-wsl.sh [-r <git ref>] [-H <hw>] [-U 0|1] [-o <outdir>]
+#   code/build-wsl.sh [-r <git ref>] [-H <hw>] [-U 0|1] [-E 0|1] [-o <outdir>]
 #
 #   -r  commit/branch/tag to build (default: HEAD). Uncommitted changes are NOT built.
 #   -H  hardware: v0.2 | v0.3 | v0.4 | v1.0 (default: v1.0)
 #   -U  1 = UF2 layout (app at 0x08004000, needs the UF2 bootloader), 0 = plain image at 0x08000000 (default: 1)
-#   -o  output directory (default: <repo>/build/<sw>-hw<hw>[-uf2]-<sha>)
+#   -E  1 = U4 /OE driven by the STM32 (board with U3 removed, R7 fitted): adds 2 x 48K bankswitched games (default: 0)
+#   -o  output directory (default: <repo>/build/<sw>-hw<hw>[-uf2][-oe]-<sha>)
 #
 # From Windows, code\build-wsl.cmd runs this script in WSL with the same options.
 #
@@ -28,19 +29,22 @@ set -euo pipefail
 REF=HEAD
 HW=v1.0
 UF2=1
+OE=0
 OUT=
-while getopts "r:H:U:o:h" opt; do
+while getopts "r:H:U:E:o:h" opt; do
     case $opt in
         r) REF=$OPTARG ;;
         H) HW=$OPTARG ;;
         U) UF2=$OPTARG ;;
+        E) OE=$OPTARG ;;
         o) OUT=$OPTARG ;;
-        *) sed -n '3,14p' "$0"; exit 1 ;;
+        *) sed -n '3,15p' "$0"; exit 1 ;;
     esac
 done
 
 case $HW in v0.2|v0.3|v0.4|v1.0) ;; *) echo "Unknown hardware '$HW' (v0.2|v0.3|v0.4|v1.0)"; exit 1 ;; esac
 case $UF2 in 0|1) ;; *) echo "-U must be 0 or 1"; exit 1 ;; esac
+case $OE in 0|1) ;; *) echo "-E must be 0 or 1"; exit 1 ;; esac
 
 SCRIPT_DIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 REPO=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)
@@ -121,8 +125,8 @@ git clone -q "$REPO" "$SRC"
 git -C "$SRC" checkout -q "$SHA"
 
 SW=$(sed -n 's/.*sys_opt\.sw_ver *= *0x[0-9A-Fa-f]*; *\/\/ *\(v[0-9.]*\).*/\1/p' "$SRC/code/stm32/main.c" | head -1)
-[ -n "$OUT" ] || OUT=$REPO/build/${SW:-sw}-hw${HW#v}$([ "$UF2" = 1 ] && echo -uf2)-$SHA
-say "Building $SHA (SW ${SW:-?}), USE_HW=$HW USE_UF2=$UF2"
+[ -n "$OUT" ] || OUT=$REPO/build/${SW:-sw}-hw${HW#v}$([ "$UF2" = 1 ] && echo -uf2)$([ "$OE" = 1 ] && echo -oe)-$SHA
+say "Building $SHA (SW ${SW:-?}), USE_HW=$HW USE_UF2=$UF2 USE_OE_CTRL=$OE"
 
 # --- Menu (6809) --------------------------------------------------------------------------------
 make -s -C "$SRC/code/menu" menu.bin
@@ -131,7 +135,7 @@ make -s -C "$SRC/code/menu" menu.bin
 cd "$SRC/code/stm32"
 cp ../menu/menu.bin .
 make -s menu.ld
-make images USE_HW="$HW" USE_UF2="$UF2" TOOLCHAIN_DIR="$TOOLS/libopencm3" > build.log 2>&1 \
+make images USE_HW="$HW" USE_UF2="$UF2" USE_OE_CTRL="$OE" TOOLCHAIN_DIR="$TOOLS/libopencm3" > build.log 2>&1 \
     || { tail -30 build.log; exit 1; }
 grep -A1 ' text' build.log
 

@@ -94,6 +94,24 @@ uint8_t checkDevMode = 0;
 cart_options cart_opt;
 char* cartOptionsData = (char*)&cart_opt;
 
+#if OE_CTRL
+// 48K bankswitched games: 2 x 48K ($0000-$BFFF), PB6 selects the bank. They don't fit in RAM, so they
+// run from flash sector 5 (the linker scripts end the firmware below it), laid out for romemu.S:
+//   0x00000-0x07FFF  PB6 high bank $0000-$7FFF    0x10000-0x13FFF  PB6 high bank $8000-$BFFF
+//   0x08000-0x0FFFF  PB6 low bank  $0000-$7FFF    0x18000-0x1BFFF  PB6 low bank  $8000-$BFFF
+// The file holds the PB6 low bank in its first 64K and the PB6 high (boot) bank in its second 64K;
+// $C000-$FFFF of each bank can't be read by the Vectrex and is not stored.
+#define GAME48_FLASH_SECTOR (5)
+#define GAME48_FLASH_BASE   (0x08020000)
+#define GAME48_HEADER_ADDR  (GAME48_FLASH_BASE + 0x14000) // in an unused hole of the layout
+#define GAME48_MAGIC        (0x38345856)                    // "VX48"
+typedef struct {
+    uint32_t magic;
+    uint32_t crc;  // CRCVX of the whole file
+    uint32_t size; // file size
+} game48_header;
+#endif
+
 FILINFO cart_file_info;
 
 /*
@@ -167,6 +185,84 @@ void loadRom(char *fn) {
     loadRomWithHighScore(fn, false, false); // by default, do not load high score mode
 }
 
+#if OE_CTRL
+static void game48Program(uint32_t addr, const char* src, uint32_t len) {
+    for (uint32_t i = 0; i < len; i += 4) {
+        flash_program_word(addr + i, MMIO32(&src[i]));
+    }
+}
+
+/**
+ * Load a 48K bankswitched game (64K < file size <= 128K) into flash, see GAME48_FLASH_BASE.
+ * Uses c_and_l.cartData as a 64K buffer. Skips the erase when the same file is already in flash.
+ * Returns false if the file can't be used, the caller then loads it as a normal game.
+ */
+static bool loadGame48(FIL* f, unsigned int* bytesRead, uint32_t* crc) {
+    char* buf = c_and_l.cartData;
+    const unsigned int half = 64*1024;
+    unsigned int n[2] = {0, 0};
+
+    if (f_size(f) > 2*half) {
+        xprintf("48K game: file too big (%lu bytes, max 128K)\n", (unsigned long)f_size(f));
+        return false;
+    }
+
+    // Pass 1: CRCVX of the whole file (same as for 32K/64K games: zero padded to 32-bit words)
+    crc_reset();
+    for (int h = 0; h < 2; h++) {
+        memset(buf, 0, half);
+        f_read(f, buf, half, &n[h]);
+        for (uint32_t i = 0; i < (n[h] + 3) / 4; i++) {
+            CRC_DR = __builtin_bswap32(MMIO32(&buf[i*4]));
+        }
+    }
+    *crc = CRC_DR;
+    *bytesRead = n[0] + n[1];
+    xprintf("48K game: %d bytes, CRCVX: %08x\n", *bytesRead, *crc);
+
+    const game48_header* hdr = (const game48_header*)GAME48_HEADER_ADDR;
+    if (hdr->magic == GAME48_MAGIC && hdr->crc == *crc && hdr->size == *bytesRead) {
+        xprintf("48K game: already in flash\n");
+        return true;
+    }
+
+    // Pass 2: erase sector 5 and program both banks
+    xprintf("48K game: erasing flash sector %d... ", GAME48_FLASH_SECTOR);
+    flash_unlock();
+    flash_clear_status_flags();
+    flash_erase_sector(GAME48_FLASH_SECTOR, FLASH_CR_PROGRAM_X32);
+    xprintf("programming... ");
+    f_lseek(f, 0);
+    for (int h = 0; h < 2; h++) {
+        unsigned int r = 0;
+        memset(buf, 0, half);
+        f_read(f, buf, half, &r);
+        uint32_t npb6 = (h == 0) ? 0x8000 : 0; // first half is the PB6 low bank, see romemu.S a15high
+        game48Program(GAME48_FLASH_BASE + npb6, &buf[0x0000], 0x8000);
+        game48Program(GAME48_FLASH_BASE + 0x10000 + npb6, &buf[0x8000], 0x4000);
+    }
+    // Only mark the image valid if both banks programmed cleanly
+    uint32_t sr = FLASH_SR & (FLASH_SR_PGSERR | FLASH_SR_PGPERR | FLASH_SR_PGAERR | FLASH_SR_WRPERR);
+    if (sr == 0) {
+        game48_header newHdr = { GAME48_MAGIC, *crc, *bytesRead };
+        game48Program(GAME48_HEADER_ADDR, (const char*)&newHdr, sizeof(newHdr));
+    }
+    flash_lock();
+
+    // Drop stale flash data cache lines for sector 5
+    flash_dcache_disable();
+    flash_dcache_reset();
+    flash_dcache_enable();
+
+    if (sr != 0) {
+        xprintf("FAILED (FLASH_SR %08x)\n", sr);
+        return false;
+    }
+    xprintf("OK!\n");
+    return true;
+}
+#endif
+
 void loadRomWithHighScore(char *fn, bool load_hs_mode, bool use_embedded_menu) {
     const int SCORE_ADDR = MENU_SYS_ADDR + 0x10;
     FIL f;
@@ -174,6 +270,9 @@ void loadRomWithHighScore(char *fn, bool load_hs_mode, bool use_embedded_menu) {
     unsigned int bytesRead = 0;
     int romDataSize = 0;
     uint32_t crcvx = 0xFFFFFFFF;
+#if OE_CTRL
+    bool game48 = false;
+#endif
     if (romData == c_and_l.cartData) {
         // loaded cart data
         romDataSize = sizeof(c_and_l.cartData);
@@ -193,8 +292,23 @@ void loadRomWithHighScore(char *fn, bool load_hs_mode, bool use_embedded_menu) {
             return;
         }
         xprintf("Opened file: %s\n", fn);
+#if OE_CTRL
+        if (romData == c_and_l.cartData && f_size(&f) > 64*1024) {
+            game48 = loadGame48(&f, &bytesRead, &crcvx);
+            if (!game48) {
+                // Load the first 64K as before
+                memset(romData, 0, romDataSize);
+                f_lseek(&f, 0);
+            }
+        }
+        if (!game48) {
+            f_read(&f, romData, 64*1024, &bytesRead);
+            xprintf("Read %d bytes of rom data.\n", bytesRead);
+        }
+#else
         f_read(&f, romData, 64*1024, &bytesRead);
         xprintf("Read %d bytes of rom data.\n", bytesRead);
+#endif
 
         // Check for cart options to enable for this ROM
         char filename_ini[_MAX_LFN];
@@ -222,6 +336,10 @@ void loadRomWithHighScore(char *fn, bool load_hs_mode, bool use_embedded_menu) {
         // I.e. If the file ends on an odd non-divisible-by-4 boundary, the file gets padded with 0's until it is.
         // The fact that we memset 0 all 64K of RAM before reading in the file,
         // ensures that we pad the last 32-bit value if necessary.
+#if OE_CTRL
+        if (!game48) // loadGame48() computed CRCVX over the whole file
+#endif
+        {
         crc_reset(); // resets the initial CRC value to 0xFFFFFFFF
         uint32_t maxCrcBytes = bytesRead / 4;
         if (bytesRead % 4 != 0) {
@@ -235,6 +353,7 @@ void loadRomWithHighScore(char *fn, bool load_hs_mode, bool use_embedded_menu) {
         }
         xprintf("CRCVX: %08x\n", CRC_DR);
         crcvx = CRC_DR;
+        }
     }
 
     // It's a game
@@ -242,6 +361,15 @@ void loadRomWithHighScore(char *fn, bool load_hs_mode, bool use_embedded_menu) {
         unsigned int x;
         unsigned int maxCartSize;
         char swapByte;
+#if OE_CTRL
+        if (game48) {
+            // Runs from flash: no padding or bank swap, and no cart RAM (writes would go to flash)
+            cartData = (char*)GAME48_FLASH_BASE;
+            romData = cartData;
+            cart_opt.ram_flags = RAM_DISABLED;
+        } else
+#endif
+        {
         if (bytesRead <= 32*1024) {
             maxCartSize = 32*1024; // 32KB game
         } else {
@@ -266,6 +394,7 @@ void loadRomWithHighScore(char *fn, bool load_hs_mode, bool use_embedded_menu) {
                 romData[x] = romData[(32*1024) + x];
                 romData[(32*1024) + x] = swapByte;
             }
+        }
         }
 
         if (load_hs_mode) {
@@ -411,6 +540,9 @@ void doChangeRom(char* basedir, int i) {
         settings.last_cursor = i;
         syncSettings();
 
+#if OE_CTRL
+        cartData = c_and_l.cartData; // loadRomWithHighScore() points it at flash for a 48K game
+#endif
         romData=c_and_l.cartData;
         xprintf("Going to read rom image %s\n", buff);
         loadRomWithHighScore(buff, true, false);
@@ -425,7 +557,11 @@ void doChangeRom(char* basedir, int i) {
  */
 static void doStartRom(void) {
     if (isItemAFile == true) {
+#if OE_CTRL
+        romData = cartData; // c_and_l.cartData, or the 48K game in flash
+#else
         romData = c_and_l.cartData;
+#endif
     } else {
         romData = menuData;
     }
@@ -554,6 +690,9 @@ void storeToRom() {
 void loadApp() {
     switch((int)parmRam[0xfe]) {
         case 0:
+#if OE_CTRL
+            cartData = c_and_l.cartData;
+#endif
             romData = c_and_l.cartData;
             xprintf("Launching /devmode.bin\n");
             loadRom("/devmode.bin");
@@ -764,6 +903,15 @@ void doLog(int data) {
 
 int main(void) {
     void (*runptr)(void)=romemu;
+
+#if OE_CTRL
+    // U4 /OE (PB8, via R7) high = Vectrex data bus buffer off, until romemu.S drives it.
+    // Done first: until here the pin floats (fit a pull-up on R7 to cover reset and the bootloader).
+    rcc_periph_clock_enable(RCC_GPIOB);
+    gpio_set(GPIOB, GPIO8);
+    gpio_mode_setup(GPIOB, GPIO_MODE_OUTPUT, GPIO_PUPD_PULLUP, GPIO8);
+    gpio_set_output_options(GPIOB, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, GPIO8);
+#endif
 
     const struct rcc_clock_scale hse_8mhz_3v3_120MHz = { /* 120MHz */
         .pllm = 8,
