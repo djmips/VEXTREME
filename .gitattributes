@@ -1,0 +1,2 @@
+# Shell scripts run in Linux/WSL: keep LF line endings even on Windows checkouts (core.autocrlf=true)
+*.sh text eol=lf

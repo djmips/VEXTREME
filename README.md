@@ -122,6 +122,7 @@ Docs
 A collection of how-tos and lessons learned lives in [docs/](docs/):
 
 - [Firmware Updates](docs/firmware-updates.md) - update VEXTREME firmware over USB with a `VEXTREME.uf2` file
+- [Building on Windows](docs/building-on-windows.md) - build the firmware in WSL without Docker
 - [Developer Mode](docs/developer-mode.md) - flash a single game over USB and run it immediately
 - [Lazy Developer](docs/lazy-developer.md) - automatically ejects the USB drive when the Vectrex is turned on
 - [Cart Options](docs/cart-options.md) - per-game `.ini` files to enable cartridge RAM

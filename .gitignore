@@ -29,6 +29,9 @@ fp-info-cache
 # Released files
 code/releases/
 
+# Output of code/build-wsl.sh
+build/
+
 # Built binaries
 *.bin
 # Exception: keep the prebuilt UF2 bootloader
