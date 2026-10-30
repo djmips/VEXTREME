@@ -41,25 +41,34 @@ make clean all USE_HW=v1.0 USE_UF2=1 USE_OE_CTRL=1
 
 ## How it works
 
-**Loader** (`loadGame48()` in `main.c`): the game doesn't fit in RAM, so it goes to internal flash sector 5
-(`0x08020000-0x0803FFFF`). The linker scripts end the firmware below it. The loader computes the game's CRC, and if
-the same file is already in flash it skips the erase; otherwise it erases the sector and programs it (about 2 seconds,
-on the first launch only). Cart RAM (`.ini` options) is disabled for these games, since cart data is in flash.
-
-Flash layout, chosen so that the existing `$0000-$7FFF` read path works unchanged:
+**RAM, not flash.** The game runs from the STM32's RAM like every other game; nothing is written to internal flash.
+96K of game and the 20K menu don't both fit in the 128K of RAM, so they share one 101K area (`c_and_l` in `main.c`):
 
 | Offset | Contents |
 |---|---|
-| `0x00000-0x07FFF` | PB6 high bank, `$0000-$7FFF` |
+| `0x00000-0x07FFF` | PB6 high bank, `$0000-$7FFF` (normal games use `0x00000-0x0FFFF` as before) |
 | `0x08000-0x0FFFF` | PB6 low bank, `$0000-$7FFF` |
 | `0x10000-0x13FFF` | PB6 high bank, `$8000-$BFFF` |
-| `0x14000` | header: magic `VX48`, CRC, size |
-| `0x18000-0x1BFFF` | PB6 low bank, `$8000-$BFFF` |
+| `0x14000-0x17FFF` | PB6 low bank, `$8000-$BFFF` |
+| `0x14420-0x1941F` | the menu (`menuData`, 20K) |
+
+Only the menu's code (its first `0x3BE0` bytes, up to `MENU_MEM_ADDR`) overlaps the game. The menu's settings, system
+data, high score and file list lie above the game and are never touched.
+
+**Loader** (`loadGame48()`): loads the game, except the 15K that overlaps the menu, since the menu is still running.
+It computes the CRC over the whole file, as for other games (high score key). Cart RAM (`.ini` options) is disabled
+for these games.
+
+- **Game start** (`doStartRom()`): `game48LoadTail()` reads the overlapping 15K from the drive (about 10 ms) and the
+  game takes over.
+- **Short reset to the menu:** `romemu.S` calls `menu48Restore()`, which copies the menu code back from the copy
+  embedded in the firmware (or from `/menu.bin`) and patches in the version, while reset is still held.
+- **Long reset to restart the game:** `romemu.S` calls `game48LoadTail()` again, while reset is still held.
 
 **Bus loop** (`romemu.S`):
 
 - `$0000-$7FFF` reads: as before, plus one store that turns U4 on after the byte is on port A.
-- `$8000-$BFFF` reads, while a 48K game runs: the same lookup with `0x10000` added.
+- `$8000-$BFFF` reads, while a 48K game runs: index `0x10000 + (!PB6 << 14) + A0-A13`.
 - `$C000-$FFFF`, writes above `$7FFF`, and the reset vector: U4 off.
 - Writes to `$0000-$7FFF`: U4 is turned on to pass the byte to port A, and off again before port A drives.
 
@@ -73,10 +82,11 @@ v1.0 board, U3 removed, R7 wired, no pull-up:
 - the menu and 32K games
 - 64K PB6 games: Y-Music (all songs and pictures)
 - a 2 x 48K PB6 game
-- a short reset back to the menu and relaunching the 48K game (no erase the second time), and a long reset restarting it
+- a short reset back to the menu (version, settings and file list intact), and a long reset restarting the 48K game
 
 ## Limits
 
 - Two banks only (PB6). Four-bank games that also use `/IRQ` as a bank line (e.g. Vectorblade) would need 4 x 48K =
-  192K, more than the flash left over.
+  192K, more than the RAM.
 - No cart RAM for 48K games.
+- RAM is tight: about 12K is left for the stack.

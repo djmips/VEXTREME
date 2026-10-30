@@ -1,7 +1,9 @@
 .code 16
 .syntax unified
 
+#if !OE_CTRL
 .global menuData
+#endif
 .global romData
 .global parmRam
 .global doHandleEvent
@@ -41,11 +43,13 @@ initloop:
 // U3 removed, R7 fitted: PB8 drives U4 /OE (the Vectrex data bus buffer)
     ldr   r11,=0x01000000       // GPIOB_BSRR value: reset PB8, U4 /OE low (U4 on)
     ldr   r12,=0x00000100       // GPIOB_BSRR value: set PB8, U4 /OE high (U4 off)
-    ldr   r0,=0x08020000        // GAME48_FLASH_BASE: is a 48K bankswitched game running?
-    mov   r10,#0                // r10 = 1 if romData is the 48K game image in flash, else 0
-    cmp   r2,r0                 // |
+    ldr   r0,=game48Active      // r10 = 1 while a 48K bankswitched game runs, else 0
+    ldrb  r10,[r0]              // | a 48K game is loaded...
+    ldr   r0,=menuDataPtr       // |
+    ldr   r0,[r0]               // |
+    cmp   r2,r0                 // | ...and romData is not the menu
     it    eq                    // |
-    moveq r10,#1                // |
+    moveq r10,#0                // |
 #if (HW_VER < 3)
     #error "USE_OE_CTRL=1 requires v0.3 or later hardware"
 #endif
@@ -124,7 +128,12 @@ check_put_menu_back:
 
 put_menu_back:
     ldr   r0,=romData           // Reset vector detected for more than 300ms, set romData to menuData
+#if OE_CTRL
+    ldr   r2,=menuDataPtr       // | menuData lives inside c_and_l, see main.c GAME48_MENU_OFFSET
+    ldr   r2,[r2]               // |
+#else
     ldr   r2,=menuData          // |
+#endif
     str   r2,[r0]               // |
 #if OE_CTRL
     mov   r10,#0                // Menu is not a 48K game (no $8000-$BFFF reads from menuData)
@@ -133,6 +142,15 @@ put_menu_back:
     strb  r0,[r2, #0]           // |
     mov   r0,# ' '              // |
     strb  r0,[r2, #1]           // |
+#if OE_CTRL
+    ldr   r0,=game48MenuClobbered // Did a 48K game overwrite the menu code?
+    ldrb  r0,[r0]               // |
+    cmp   r0,#0                 // |
+    beq   skip_put_menu_back    // | no
+    ldr   r0,=menu48Restore     // | yes, put it back (reset is still held, the Vectrex waits)
+    blx   r0                    // |
+    b     initloop              // | reload the registers the call clobbered (r8 count is kept)
+#endif
 
 skip_put_menu_back:
 
@@ -153,6 +171,16 @@ put_cart_back:
     //str   r5,[r4, 0x18]         // Output to GPIOB_BSRR
 
     // Reset vector detected for more than 700ms, set romData to cartData
+#if OE_CTRL
+    ldr   r0,=game48Active      // A 48K game? The menu code overwrote part of it: load that part again
+    ldrb  r0,[r0]               // |
+    cmp   r0,#0                 // |
+    beq   1f                    // |
+    ldr   r0,=game48LoadTail    // | (reset is still held, the Vectrex waits)
+    blx   r0                    // |
+    ldr   r1,=0x40020800        // | GPIOC base again, waitreset needs it
+1:
+#endif
     ldr   r0,=romData
     ldr   r2,=cartData
     ldr   r2,[r2]               // dereference cartData pointer
@@ -217,9 +245,9 @@ readbyte:
 #if OE_CTRL
 // ===========================================================
 // A15 high: $8000-$BFFF is ours only while a 48K game runs; $C000-$FFFF is Vectrex RAM, VIA and BIOS.
-// 48K game image layout (romData = GAME48_FLASH_BASE), index = (addr pins ^ 0x8000) as for $0000-$7FFF:
-//   0x00000-0x0FFFF  $0000-$7FFF of both banks (PB6 high bank first, as for 64K games)
-//   0x10000-0x1FFFF  $8000-$BFFF of both banks (A14 = 0, so 16K at 0x10000 and 16K at 0x18000)
+// 48K game layout in RAM (see main.c GAME48_SIZE), 96K:
+//   0x00000-0x0FFFF  $0000-$7FFF of both banks, index = addr pins ^ 0x8000 as for 64K games (PB6 high first)
+//   0x10000-0x17FFF  $8000-$BFFF of both banks, index = 0x10000 + (!PB6 << 14) + A0-A13
 a15high:
     cmp   r10,#0                // 48K game running?
     beq   u4off                 // No, $8000-$FFFF is not ours
@@ -228,8 +256,10 @@ a15high:
     bmi   u4off                 // A14 set? $C000-$FFFF, not ours
     lsls  r6,r0,#(31-1)         // Shift R/W (bit 1 of GPIOB) into sign flag
     bpl   u4off                 // Write? Nothing to write to at $8000-$BFFF
-    eor   r0,r5,#0x8000         // Invert PB6 as for $0000-$7FFF
-    add   r0,r0,#0x10000        // $8000-$BFFF windows start 64K into the image
+    eor   r0,r5,#0x8000         // Invert PB6: bit 15 = !PB6, bit 14 (A14) = 0
+    lsr   r6,r0,#15             // r6 = !PB6
+    bfi   r0,r6,#14,#2          // Move it down: bit 15 = 0, bit 14 = !PB6
+    add   r0,r0,#0x10000        // $8000-$BFFF windows start 64K into the game
     b     readbyte
 
 u4off:

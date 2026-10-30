@@ -29,5 +29,9 @@ void storeToRom(void);
 void syncSettings(void);
 void applyLedSettings(bool initial);
 void resetIntoBootloader(void);
+#if OE_CTRL
+void game48LoadTail(void);
+void menu48Restore(void);
+#endif
 
 #endif

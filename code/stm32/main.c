@@ -67,9 +67,43 @@ extern char menu_end;
 #define PARM_RAM_ADDR   (0x7f00)
 #define PARM_RAM_SIZE   (0xfe)
 
+#if OE_CTRL
+// 48K bankswitched games: 2 x 48K ($0000-$BFFF), PB6 selects the bank. The 96K game and the 20K menu share
+// one RAM area: the game fills the first 96K, and the menu sits at the end, so that only the menu's code
+// ($0000 up to MENU_MEM_ADDR) overlaps the game. Its settings, system data and listing are never touched.
+//   0x00000-0x07FFF  PB6 high bank $0000-$7FFF    0x10000-0x13FFF  PB6 high bank $8000-$BFFF
+//   0x08000-0x0FFFF  PB6 low bank  $0000-$7FFF    0x14000-0x17FFF  PB6 low bank  $8000-$BFFF (overlaps menu code)
+// While the menu runs, the overlapping part of the game is not loaded; game48LoadTail() loads it when the
+// game starts, and menu48Restore() puts the menu code back from its source on a reset back to the menu.
+#define GAME48_SIZE        (96*1024)
+#define GAME48_MENU_OFFSET (GAME48_SIZE - MENU_MEM_ADDR)    // menuData within c_and_l
+#define GAME48_TAIL_FILE   (0x8000 + GAME48_MENU_OFFSET - 0x14000) // file offset of the game bytes at GAME48_MENU_OFFSET
+#define GAME48_BUF         ((char*)&c_and_l)                // the 96K game, past the end of cartData
+
+union cart_and_listing {
+    dir_listing listing;
+    char cartData[64*1024];
+    struct {
+        char game[GAME48_MENU_OFFSET];
+        char menu[20*1024];
+    } ram48;
+};
+static_assert(sizeof(dir_listing) <= GAME48_MENU_OFFSET, "the file listing must not overlap the menu");
+
+union cart_and_listing c_and_l;
+#define menuData (c_and_l.ram48.menu)
+char* const menuDataPtr = c_and_l.ram48.menu; // for romemu.S
+
+uint8_t game48Active = 0;          // a 48K game is loaded (romemu.S answers $8000-$BFFF while it runs)
+uint8_t game48MenuClobbered = 0;   // the game's tail overwrites the menu code (romemu.S restores it on reset)
+static char game48Path[300];
+#endif
+
 // Memory for the menu ROM and the running cartridge.
 // We keep both in memory so we can quickly exchange them when a reset has been detected.
+#if !OE_CTRL
 char menuData[20*1024]; // 16KB for menu ROM, 4KB for menu data
+#endif
 char* romData = menuData;
 unsigned char parmRam[256];
 
@@ -79,12 +113,14 @@ static bool isItemAFile = false; // Default to being a directory and not a file
 static SettingsRecord settings = {0};
 static bool settingsReady = false;
 
+#if !OE_CTRL
 union cart_and_listing {
     dir_listing listing;
     char cartData[64*1024];
 };
 
 union cart_and_listing c_and_l;
+#endif
 char* cartData = c_and_l.cartData;
 
 system_options sys_opt;
@@ -93,24 +129,6 @@ uint8_t checkDevMode = 0;
 
 cart_options cart_opt;
 char* cartOptionsData = (char*)&cart_opt;
-
-#if OE_CTRL
-// 48K bankswitched games: 2 x 48K ($0000-$BFFF), PB6 selects the bank. They don't fit in RAM, so they
-// run from flash sector 5 (the linker scripts end the firmware below it), laid out for romemu.S:
-//   0x00000-0x07FFF  PB6 high bank $0000-$7FFF    0x10000-0x13FFF  PB6 high bank $8000-$BFFF
-//   0x08000-0x0FFFF  PB6 low bank  $0000-$7FFF    0x18000-0x1BFFF  PB6 low bank  $8000-$BFFF
-// The file holds the PB6 low bank in its first 64K and the PB6 high (boot) bank in its second 64K;
-// $C000-$FFFF of each bank can't be read by the Vectrex and is not stored.
-#define GAME48_FLASH_SECTOR (5)
-#define GAME48_FLASH_BASE   (0x08020000)
-#define GAME48_HEADER_ADDR  (GAME48_FLASH_BASE + 0x14000) // in an unused hole of the layout
-#define GAME48_MAGIC        (0x38345856)                    // "VX48"
-typedef struct {
-    uint32_t magic;
-    uint32_t crc;  // CRCVX of the whole file
-    uint32_t size; // file size
-} game48_header;
-#endif
 
 FILINFO cart_file_info;
 
@@ -186,80 +204,117 @@ void loadRom(char *fn) {
 }
 
 #if OE_CTRL
-static void game48Program(uint32_t addr, const char* src, uint32_t len) {
-    for (uint32_t i = 0; i < len; i += 4) {
-        flash_program_word(addr + i, MMIO32(&src[i]));
+/**
+ * Read len bytes of a 48K game file and feed them to the CRC unit (CRCVX, as for other games).
+ * dst == NULL: only CRC them. A short read at the end of the file is zero padded for the CRC.
+ */
+static UINT game48ReadCrc(FIL* f, char* dst, UINT len) {
+    char tmp[256];
+    UINT total = 0;
+    while (len > 0) {
+        UINT chunk = (dst == NULL && len > sizeof(tmp)) ? sizeof(tmp) : len;
+        char* p = (dst == NULL) ? tmp : dst + total;
+        UINT n = 0;
+        f_read(f, p, chunk, &n);
+        for (UINT i = 0; i < n; i += 4) {
+            uint32_t w = 0;
+            memcpy(&w, &p[i], (n - i < 4) ? n - i : 4);
+            CRC_DR = __builtin_bswap32(w);
+        }
+        total += n;
+        if (n < chunk) {
+            break; // end of file
+        }
+        len -= n;
     }
+    return total;
 }
 
 /**
- * Load a 48K bankswitched game (64K < file size <= 128K) into flash, see GAME48_FLASH_BASE.
- * Uses c_and_l.cartData as a 64K buffer. Skips the erase when the same file is already in flash.
- * Returns false if the file can't be used, the caller then loads it as a normal game.
+ * Load a 48K bankswitched game (64K < file size <= 128K) into RAM, see GAME48_SIZE.
+ * The file holds the PB6 low bank in its first 64K and the PB6 high (boot) bank in its second 64K, each
+ * $0000-$FFFF; $C000-$FFFF can't be read by the Vectrex and is skipped. The part of the game that overlaps
+ * the menu is left for game48LoadTail(), since the menu is still running.
+ * Returns false if the file can't be used; the caller then loads it as a normal game.
  */
-static bool loadGame48(FIL* f, unsigned int* bytesRead, uint32_t* crc) {
-    char* buf = c_and_l.cartData;
-    const unsigned int half = 64*1024;
-    unsigned int n[2] = {0, 0};
+static bool loadGame48(FIL* f, const char* fn, unsigned int* bytesRead, uint32_t* crc) {
+    char* buf = GAME48_BUF;
 
-    if (f_size(f) > 2*half) {
+    if (f_size(f) > 128*1024 || strlen(fn) >= sizeof(game48Path)) {
         xprintf("48K game: file too big (%lu bytes, max 128K)\n", (unsigned long)f_size(f));
         return false;
     }
 
-    // Pass 1: CRCVX of the whole file (same as for 32K/64K games: zero padded to 32-bit words)
+    // pad with 0x01 like the other games, in case the file is short
+    memset(buf, 0x01, GAME48_MENU_OFFSET);
     crc_reset();
-    for (int h = 0; h < 2; h++) {
-        memset(buf, 0, half);
-        f_read(f, buf, half, &n[h]);
-        for (uint32_t i = 0; i < (n[h] + 3) / 4; i++) {
-            CRC_DR = __builtin_bswap32(MMIO32(&buf[i*4]));
-        }
-    }
+    UINT n = 0;
+    // PB6 low bank: $0000-$7FFF, then $8000-$BFFF up to the menu, the rest only for the CRC
+    n += game48ReadCrc(f, &buf[0x08000], 0x8000);
+    n += game48ReadCrc(f, &buf[0x14000], GAME48_MENU_OFFSET - 0x14000);
+    n += game48ReadCrc(f, NULL, GAME48_SIZE - GAME48_MENU_OFFSET);
+    n += game48ReadCrc(f, NULL, 0x4000);
+    // PB6 high bank: $0000-$7FFF, $8000-$BFFF
+    n += game48ReadCrc(f, &buf[0x00000], 0x8000);
+    n += game48ReadCrc(f, &buf[0x10000], 0x4000);
+    n += game48ReadCrc(f, NULL, 0x4000);
     *crc = CRC_DR;
-    *bytesRead = n[0] + n[1];
-    xprintf("48K game: %d bytes, CRCVX: %08x\n", *bytesRead, *crc);
+    *bytesRead = n;
 
-    const game48_header* hdr = (const game48_header*)GAME48_HEADER_ADDR;
-    if (hdr->magic == GAME48_MAGIC && hdr->crc == *crc && hdr->size == *bytesRead) {
-        xprintf("48K game: already in flash\n");
-        return true;
-    }
-
-    // Pass 2: erase sector 5 and program both banks
-    xprintf("48K game: erasing flash sector %d... ", GAME48_FLASH_SECTOR);
-    flash_unlock();
-    flash_clear_status_flags();
-    flash_erase_sector(GAME48_FLASH_SECTOR, FLASH_CR_PROGRAM_X32);
-    xprintf("programming... ");
-    f_lseek(f, 0);
-    for (int h = 0; h < 2; h++) {
-        unsigned int r = 0;
-        memset(buf, 0, half);
-        f_read(f, buf, half, &r);
-        uint32_t npb6 = (h == 0) ? 0x8000 : 0; // first half is the PB6 low bank, see romemu.S a15high
-        game48Program(GAME48_FLASH_BASE + npb6, &buf[0x0000], 0x8000);
-        game48Program(GAME48_FLASH_BASE + 0x10000 + npb6, &buf[0x8000], 0x4000);
-    }
-    // Only mark the image valid if both banks programmed cleanly
-    uint32_t sr = FLASH_SR & (FLASH_SR_PGSERR | FLASH_SR_PGPERR | FLASH_SR_PGAERR | FLASH_SR_WRPERR);
-    if (sr == 0) {
-        game48_header newHdr = { GAME48_MAGIC, *crc, *bytesRead };
-        game48Program(GAME48_HEADER_ADDR, (const char*)&newHdr, sizeof(newHdr));
-    }
-    flash_lock();
-
-    // Drop stale flash data cache lines for sector 5
-    flash_dcache_disable();
-    flash_dcache_reset();
-    flash_dcache_enable();
-
-    if (sr != 0) {
-        xprintf("FAILED (FLASH_SR %08x)\n", sr);
-        return false;
-    }
-    xprintf("OK!\n");
+    strcpy(game48Path, fn);
+    game48Active = 1;
+    xprintf("48K game: %d bytes, CRCVX: %08x\n", n, *crc);
     return true;
+}
+
+/**
+ * Load the part of the 48K game that overlaps the menu code. Called when the game starts and when a
+ * long reset restarts it; the menu code is gone until menu48Restore().
+ */
+void game48LoadTail(void) {
+    FIL f;
+    UINT n = 0;
+    memset(&GAME48_BUF[GAME48_MENU_OFFSET], 0x01, GAME48_SIZE - GAME48_MENU_OFFSET);
+    game48MenuClobbered = 1;
+    if (f_open(&f, game48Path, FA_READ) != FR_OK) {
+        xprintf("48K game: can't reopen %s\n", game48Path);
+        return;
+    }
+    f_lseek(&f, GAME48_TAIL_FILE);
+    f_read(&f, &GAME48_BUF[GAME48_MENU_OFFSET], GAME48_SIZE - GAME48_MENU_OFFSET, &n);
+    f_close(&f);
+}
+
+/**
+ * Put the menu code (menuData up to MENU_MEM_ADDR) back after a 48K game overwrote it. Called from romemu.S
+ * on a reset back to the menu. The menu's settings, system data and listing are above MENU_MEM_ADDR and
+ * were never overwritten.
+ */
+void menu48Restore(void) {
+    FIL f;
+    UINT n = 0;
+    if (f_open(&f, "/menu.bin", FA_READ) == FR_OK) {
+        f_read(&f, menuData, MENU_MEM_ADDR, &n);
+        f_close(&f);
+    } else {
+        memcpy(menuData, &menu_start, (&menu_end - &menu_start < MENU_MEM_ADDR) ? (size_t)(&menu_end - &menu_start) : MENU_MEM_ADDR);
+    }
+    // Patch in the HW/SW versions, as loadRomWithHighScore() does for the menu
+    char* ptr1 = strstr(menuData, "11");
+    char* ptr2 = strstr(menuData, "22");
+    char* ptr3 = strstr(menuData, "33");
+    char* ptr4 = strstr(menuData, "44");
+    if (ptr1 && ptr2 && ptr3 && ptr4) {
+        *ptr1++ = 'V';
+        *ptr1   = '0' + (sys_opt.hw_ver >> 8) % 10;
+        *ptr2++ = '0' + (sys_opt.hw_ver & 0xFF) / 10;
+        *ptr2   = '0' + (sys_opt.hw_ver & 0xFF) % 10;
+        *ptr3++ = 'V';
+        *ptr3   = '0' + (sys_opt.sw_ver >> 8) % 10;
+        *ptr4++ = '0' + (sys_opt.sw_ver & 0xFF) / 10;
+        *ptr4   = '0' + (sys_opt.sw_ver & 0xFF) % 10;
+    }
+    game48MenuClobbered = 0;
 }
 #endif
 
@@ -293,12 +348,15 @@ void loadRomWithHighScore(char *fn, bool load_hs_mode, bool use_embedded_menu) {
         }
         xprintf("Opened file: %s\n", fn);
 #if OE_CTRL
-        if (romData == c_and_l.cartData && f_size(&f) > 64*1024) {
-            game48 = loadGame48(&f, &bytesRead, &crcvx);
-            if (!game48) {
-                // Load the first 64K as before
-                memset(romData, 0, romDataSize);
-                f_lseek(&f, 0);
+        if (romData == c_and_l.cartData) {
+            game48Active = 0;
+            if (f_size(&f) > 64*1024) {
+                game48 = loadGame48(&f, fn, &bytesRead, &crcvx);
+                if (!game48) {
+                    // Load the first 64K as before
+                    memset(romData, 0, romDataSize);
+                    f_lseek(&f, 0);
+                }
             }
         }
         if (!game48) {
@@ -363,9 +421,7 @@ void loadRomWithHighScore(char *fn, bool load_hs_mode, bool use_embedded_menu) {
         char swapByte;
 #if OE_CTRL
         if (game48) {
-            // Runs from flash: no padding or bank swap, and no cart RAM (writes would go to flash)
-            cartData = (char*)GAME48_FLASH_BASE;
-            romData = cartData;
+            // Already padded and laid out by loadGame48(). No cart RAM: its writes ignore the bank layout.
             cart_opt.ram_flags = RAM_DISABLED;
         } else
 #endif
@@ -540,9 +596,6 @@ void doChangeRom(char* basedir, int i) {
         settings.last_cursor = i;
         syncSettings();
 
-#if OE_CTRL
-        cartData = c_and_l.cartData; // loadRomWithHighScore() points it at flash for a 48K game
-#endif
         romData=c_and_l.cartData;
         xprintf("Going to read rom image %s\n", buff);
         loadRomWithHighScore(buff, true, false);
@@ -558,10 +611,11 @@ void doChangeRom(char* basedir, int i) {
 static void doStartRom(void) {
     if (isItemAFile == true) {
 #if OE_CTRL
-        romData = cartData; // c_and_l.cartData, or the 48K game in flash
-#else
-        romData = c_and_l.cartData;
+        if (game48Active) {
+            game48LoadTail(); // the menu has handed over: load the part of the game that overlaps it
+        }
 #endif
+        romData = c_and_l.cartData;
     } else {
         romData = menuData;
     }
@@ -690,9 +744,6 @@ void storeToRom() {
 void loadApp() {
     switch((int)parmRam[0xfe]) {
         case 0:
-#if OE_CTRL
-            cartData = c_and_l.cartData;
-#endif
             romData = c_and_l.cartData;
             xprintf("Launching /devmode.bin\n");
             loadRom("/devmode.bin");
