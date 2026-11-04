@@ -22,6 +22,9 @@ Normal 32K games, 64K PB6 games and the menu keep working on a modified board. A
 3. **Optional:** a pull-up (4.7k-47k) from R7 to 3.3V keeps U4 off during reset and while the UF2 bootloader runs,
    before the firmware drives PB8.
 
+**Without U3, U4 drives the bus into the next cycle; it crashed one Vectrex. See
+[U4 /OE Gate Rework](oe-gate-rework.md) for the planned fix (U3 back, gating PB8 with E).**
+
 **A modified board needs the `USE_OE_CTRL=1` firmware.** Any other firmware leaves U4 `/OE` floating, so the cart must
 not go into a Vectrex until it's flashed. USB, the drive and DFU do not use U4, so flashing works as usual.
 
